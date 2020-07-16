@@ -10,6 +10,8 @@ import pandas as pd
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tsa.seasonal import seasonal_decompose
+from sklearn.preprocessing import PowerTransformer, MinMaxScaler
+from sklearn.pipeline import Pipeline
 
 # COMMAND ----------
 
@@ -345,6 +347,298 @@ display(train_cc_country)
 
 # Download using Databricks UI
 display(train_cc_us_state)
+
+# COMMAND ----------
+
+# SELECTING G7 COUNTRIES (excluding US)
+
+# Get absolute value of cases for each country
+canada_cc = train_cc_country.filter(col("Country_Region")=="Canada").select(col("Date"), abs(col("TargetValue")).alias("canada_cases"))
+japan_cc = train_cc_country.filter(col("Country_Region")=="Japan").select(col("Date"), abs(col("TargetValue")).alias("japan_cases"))
+italy_cc = train_cc_country.filter(col("Country_Region")=="Italy").select(col("Date"), abs(col("TargetValue")).alias("italy_cases"))
+uk_cc = train_cc_country.filter(col("Country_Region")=="United Kingdom").select(col("Date"), abs(col("TargetValue")).alias("uk_cases"))
+ger_cc =train_cc_country.filter(col("Country_Region")=="Germany").select(col("Date"), abs(col("TargetValue")).alias("germany_cases"))
+france_cc = train_cc_country.filter(col("Country_Region")=="France").select(col("Date"), abs(col("TargetValue")).alias("france_cases"))
+
+
+# COMMAND ----------
+
+# PLOTTING FUNCTIONS
+
+# Plot daily cases for G6 countries
+def plot_multi_daily_cases(data, cols):
+  df=data.orderBy("Date").toPandas()
+  x = df["Date"]
+  for c in cols:
+    plt.plot(x, df[c], label = c)
+  plt.xlabel('Date')
+  plt.ylabel('Num Confirmed Cases')
+  plt.title('New Cases Per Day')
+  plt.legend()
+  plt.show()
+
+# Plot cumulative cases for G6 countries
+def plot_multi_cum_cases(data, cols):
+  df=data.orderBy("Date").toPandas()
+  x = df["Date"]
+  for c in cols:
+    plt.plot(x, np.cumsum(df[c]), label = c)
+  plt.xlabel('Date')
+  plt.ylabel('Cumulative Cases')
+  plt.title('New Cases Per Day')
+  plt.legend()
+  plt.show()
+
+# COMMAND ----------
+
+# Remove outliers (values above given percentile of data)
+def remove_outliers(data, max_percentile, col_name):
+  # Get value at specified percentile
+  upperBound = data.approxQuantile(col_name, [max_percentile], 0)[0]
+  return data \
+    .withColumn(col_name+"_filt", when(col(col_name)>upperBound, lit(upperBound)).otherwise(col(col_name))) \
+    .select(col("Date"), col(col_name).alias(col_name+"_orig"), col(col_name+"_filt").alias(col_name))
+
+# COMMAND ----------
+
+# Target percentile
+target_pct = 0.97
+
+# Removed values greater than target percentile for canada data
+canada_cc_filt = remove_outliers(canada_cc, target_pct, "canada_cases")
+plot_multi_daily_cases(canada_cc_filt,["canada_cases_orig", "canada_cases"])
+
+# COMMAND ----------
+
+# Removed values greater than target percentile for japan data
+japan_cc_filt = remove_outliers(japan_cc, target_pct, "japan_cases")
+plot_multi_daily_cases(japan_cc_filt,["japan_cases_orig", "japan_cases"])
+
+# COMMAND ----------
+
+# Removed values greater than target percentile for italy data
+italy_cc_filt = remove_outliers(italy_cc, target_pct, "italy_cases")
+plot_multi_daily_cases(italy_cc_filt,["italy_cases_orig", "italy_cases"])
+
+# COMMAND ----------
+
+# Removed values greater than target percentile for uk data
+uk_cc_filt = remove_outliers(uk_cc, target_pct, "uk_cases")
+plot_multi_daily_cases(uk_cc_filt,["uk_cases_orig", "uk_cases"])
+
+# COMMAND ----------
+
+# Removed values greater than target percentile for germany data
+germany_cc_filt = remove_outliers(ger_cc, target_pct, "germany_cases")
+plot_multi_daily_cases(germany_cc_filt,["germany_cases_orig", "germany_cases"])
+
+# COMMAND ----------
+
+# Removed values greater than target percentile for france data
+france_cc_filt = remove_outliers(france_cc, target_pct, "france_cases")
+plot_multi_daily_cases(france_cc_filt,["france_cases_orig", "france_cases"])
+
+# COMMAND ----------
+
+# Rename columns for easy join
+canada_cc = canada_cc_filt.select(col("Date"), "canada_cases")
+japan_cc = japan_cc_filt.select(col("Date").alias("japan_dt"), "japan_cases")
+italy_cc = italy_cc_filt.select(col("Date").alias("italy_dt"), "italy_cases")
+uk_cc = uk_cc_filt.select(col("Date").alias("uk_dt"), "uk_cases")
+germany_cc = germany_cc_filt.select(col("Date").alias("germany_dt"), "germany_cases")
+france_cc = france_cc_filt.select(col("Date").alias("france_dt"), "france_cases")
+
+# Build G6 dataset
+g6_cc = canada_cc \
+  .join(japan_cc, canada_cc.Date==japan_cc.japan_dt) \
+  .join(italy_cc, canada_cc.Date==italy_cc.italy_dt) \
+  .join(uk_cc, canada_cc.Date==uk_cc.uk_dt) \
+  .join(germany_cc, canada_cc.Date==germany_cc.germany_dt) \
+  .join(france_cc, canada_cc.Date==france_cc.france_dt) \
+  .select(canada_cc.Date, col("canada_cases"), col("japan_cases"), col("italy_cases"), col("uk_cases"), col("germany_cases"), col("france_cases"))
+  
+g6_cc.show()
+
+# COMMAND ----------
+
+# Plot daily cases for G6 countries
+plot_multi_daily_cases(g6_cc,list(g6_cc.schema.names)[1:])
+
+# COMMAND ----------
+
+# Plot cumulative cases for G6 countries
+plot_multi_cum_cases(g6_cc,list(g6_cc.schema.names)[1:])
+
+# COMMAND ----------
+
+# EVALUATE STATIONARITY OF G6 COUNTRIES
+
+# Adfuller Test
+df=g6_cc.orderBy("Date").toPandas()
+all_cc = []
+for c in df.columns[1:]: 
+  result = adfuller(df[c].values)
+  all_cc.append([c.split('_')[0]]+list(result[0:4]))
+  
+print(pd.DataFrame(all_cc, columns = ["Country","ADF Stat","p-value","Lags Used","Observations"]))
+
+# COMMAND ----------
+
+# Test autocorrelation for Canada
+test_autocorrelation(train_cc_country.filter(col("Country_Region")=="Canada"), "Canada")
+test_autocorrelation(train_cc_country.filter(col("Country_Region")=="Japan"), "Japan")
+test_autocorrelation(train_cc_country.filter(col("Country_Region")=="Italy"), "Italy")
+test_autocorrelation(train_cc_country.filter(col("Country_Region")=="United Kingdom"), "UK")
+test_autocorrelation(train_cc_country.filter(col("Country_Region")=="Germany"), "Germany")
+test_autocorrelation(train_cc_country.filter(col("Country_Region")=="France"), "France")
+
+# COMMAND ----------
+
+# ADDING MOVING AVERAGE AS A FEATURE
+days = lambda i: i * 86400 
+roll_window = (Window.orderBy(col("Date").cast("long")).rangeBetween(-days(6), 0))
+g6_cc_ma = g6_cc \
+  .withColumn('canada_ma', avg("canada_cases").over(roll_window)) \
+  .withColumn('japan_ma', avg("japan_cases").over(roll_window)) \
+  .withColumn('italy_ma', avg("italy_cases").over(roll_window)) \
+  .withColumn('uk_ma', avg("uk_cases").over(roll_window)) \
+  .withColumn('germany_ma', avg("germany_cases").over(roll_window)) \
+  .withColumn('france_ma', avg("france_cases").over(roll_window)) \
+  .orderBy(col("Date"))
+
+g6_cc_ma.show()
+
+# COMMAND ----------
+
+# Plot daily cases vs moving average for Canada
+plot_multi_daily_cases(g6_cc_ma,["canada_cases", "canada_ma"])
+
+# COMMAND ----------
+
+# Plot daily cases vs moving average for Japan
+plot_multi_daily_cases(g6_cc_ma,["japan_cases", "japan_ma"])
+
+# COMMAND ----------
+
+# Plot daily cases vs moving average for Italy
+plot_multi_daily_cases(g6_cc_ma,["italy_cases", "italy_ma"])
+
+# COMMAND ----------
+
+# Plot daily cases vs moving average for UK
+plot_multi_daily_cases(g6_cc_ma,["uk_cases", "uk_ma"])
+
+# COMMAND ----------
+
+# Plot daily cases vs moving average for Germany
+plot_multi_daily_cases(g6_cc_ma,["germany_cases", "germany_ma"])
+
+# COMMAND ----------
+
+# Plot daily cases vs moving average for France
+plot_multi_daily_cases(g6_cc_ma,["france_cases", "france_ma"])
+
+# COMMAND ----------
+
+# EXPLORING POWER TRANSFORM
+
+def power_transform_feature(data, col):
+  df=data.orderBy("Date").toPandas()
+  df['pwr_tf']=df[col]
+  
+  sc = MinMaxScaler(feature_range=(1, 2))
+  pt = PowerTransformer(method='box-cox')
+  pipeline = Pipeline(steps=[('s', sc),('p', pt)])
+  df[['pwr_tf']] = pipeline.fit_transform(df[['pwr_tf']])
+
+  fig, axs = plt.subplots(2, 2, figsize=(10,7))
+  fig.suptitle(col)
+
+  axs[0, 0].plot(df["Date"], df[col])
+  axs[0, 0].set(xlabel='Date', ylabel='Num Cases')
+  axs[0, 0].set_title('Daily Cases')
+
+  axs[0, 1].hist(df[col])
+  axs[0, 1].set(xlabel='Num Cases', ylabel='Freq')
+  axs[0, 1].set_title('Histogram Daily Cases')
+
+  axs[1, 0].plot(df["Date"], df['pwr_tf'])
+  axs[1, 0].set(xlabel='Date', ylabel='Num Cases')
+  axs[1, 0].set_title('After Power Transform')
+
+  axs[1, 1].hist(df['pwr_tf'])
+  axs[1, 1].set(xlabel='Num Cases', ylabel='Freq')
+  axs[1, 1].set_title('Histogram After PT')
+
+  for ax in axs.flat:
+      ax.set(xlabel='Date', ylabel='Num Cases')
+
+  # Hide x labels and tick labels for top plots and y ticks for right plots.
+  for ax in axs.flat:
+      ax.label_outer()
+
+  plt.tight_layout()
+
+
+# COMMAND ----------
+
+power_transform_feature(g6_cc, "canada_cases")
+
+# COMMAND ----------
+
+power_transform_feature(g6_cc, "japan_cases")
+
+# COMMAND ----------
+
+power_transform_feature(g6_cc, "italy_cases")
+
+# COMMAND ----------
+
+power_transform_feature(g6_cc, "uk_cases")
+
+# COMMAND ----------
+
+power_transform_feature(g6_cc, "germany_cases")
+
+# COMMAND ----------
+
+power_transform_feature(g6_cc, "france_cases")
+
+# COMMAND ----------
+
+# ADDING POWER TRANSFORM (BOX-COX) AS A FEATURE
+
+# Prep data
+df=g6_cc_ma.orderBy("Date").toPandas()
+df['canada_pt']=df['canada_cases']
+df['japan_pt']=df['japan_cases']
+df['italy_pt']=df['italy_cases']
+df['uk_pt']=df['uk_cases']
+df['germany_pt']=df['germany_cases']
+df['france_pt']=df['france_cases']
+
+# Initialize pipeline
+sc = MinMaxScaler(feature_range=(1, 2))
+pt = PowerTransformer(method='box-cox')
+pipeline = Pipeline(steps=[('s', sc),('p', pt)])
+
+# Apply transform
+col_list = ['canada_pt','japan_pt','italy_pt','uk_pt','germany_pt','france_pt']
+df[col_list] = pipeline.fit_transform(df[col_list])
+
+g6_pt = spark.createDataFrame(df)
+
+# COMMAND ----------
+
+# ADD DAY OF WEEK (INTEGER) AS FEATURE
+
+g6_features = g6_pt.withColumn('dow', dayofweek(col('Date')))
+g6_features.show()
+
+
+# COMMAND ----------
+
+display(g6_features)
 
 # COMMAND ----------
 
