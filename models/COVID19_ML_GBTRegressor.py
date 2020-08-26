@@ -72,37 +72,11 @@ class RollingKFoldCV(CrossValidator):
 
 # COMMAND ----------
 
-# # LOAD DATA (train.csv)
-
-# # Note: CSVs have already been loaded using the Databricks UI
-# df_temp = spark.table("g6_confirmed_cases_1_csv")
-
-# data = df_temp \
-#   .withColumn("Date2", to_timestamp("Date")) \
-#   .select( \
-#     col("Date2").alias("Date"), \
-#     "canada_cases","japan_cases","italy_cases","uk_cases","germany_cases","france_cases", \
-#     "canada_1lag","japan_1lag","italy_1lag","uk_1lag","germany_1lag","france_1lag", \
-#     "canada_2lag","japan_2lag","italy_2lag","uk_2lag","germany_2lag","france_2lag", \
-#     "canada_3lag","japan_3lag","italy_3lag","uk_3lag","germany_3lag","france_3lag", \
-#     "canada_ma","japan_ma","italy_ma","uk_ma","germany_ma","france_ma", \
-#     "canada_pt","japan_pt","italy_pt","uk_pt","germany_pt","france_pt" \
-#   ) \
-#   .orderBy(col("Date"))
-
-
-# print(data.dtypes)
-# display(data)
-
-
-
-# COMMAND ----------
-
 # Note: CSVs have already been loaded using the Databricks UI
 # LOAD DATA (train.csv)
 
 # Note: CSVs have already been loaded using the Databricks UI
-df_temp = spark.table("features_new_csv")
+df_temp = spark.table("g6_all_features_csv")
 
 data = df_temp \
   .withColumnRenamed("Date", "Date_str") \
@@ -150,21 +124,25 @@ EXTENDED_FEATURES = ORIGINAL_FEATURES + [ \
     'Italy_Outdoor_Mobility', 'Italy_indoorMobility', 'United_Kingdom_Outdoor_Mobility', 'United_Kingdom_indoorMobility', \
     'temp_canada', 'temp_uk', 'temp_italy', 'temp_japan', 'temp_germany', 'temp_france']
 
-ORIGINAL_FEATURES_CANADA = ["canada_cases", "canada_1lag", "canada_2lag", "canada_3lag", "canada_ma", "canada_pt", "dow"]
-
-EXTENDED_FEATURES_CANADA = ORIGINAL_FEATURES_CANADA + \
-    ['Canada_Outdoor_Mobility', 'Canada_indoorMobility', "temp_canada"]
-
 # COMMAND ----------
 
 # HELPER FUNCTIONS
 
-def train_test_split(full_data, target_label, feature_list):
+def train_test_split(full_data, country, feature_list, time_horizon):
+  target_label=country+"_cases"
+  prev=country+"_1lag"
+  w = Window.orderBy(col("Date"))
   # Assemble feature vector where Canada cases are the target
   vectorAssembler = VectorAssembler(inputCols = feature_list, outputCol = 'features')
-  vdata = vectorAssembler.transform(full_data)
-  train = vdata.select(['features', target_label]).filter(col("Date")<SPLIT_DT)
-  test = vdata.select(['features', target_label]).filter(col("Date")>=SPLIT_DT)
+  vdata = vectorAssembler.transform(full_data) \
+    .withColumnRenamed(target_label, "actual_orig") \
+    .withColumn("actual", lead(col("actual_orig"), time_horizon).over(w)) \
+    .withColumn("diff", col("actual_orig")-col(prev)) \
+    .withColumn("actual_diff", lead(col("diff"), time_horizon).over(w)) \
+    .filter(col("actual_diff").isNotNull())
+  
+  train = vdata.select(['features', "Date", "actual_orig", "diff", "actual", "actual_diff"]).filter(col("Date")<SPLIT_DT)
+  test = vdata.select(['features', "Date", "actual_orig", "diff", "actual", "actual_diff"]).filter(col("Date")>=SPLIT_DT)
 
   print("Total days: " + str(vdata.count()))
   print("Total days for train dataset: " + str(train.count()))
@@ -172,19 +150,19 @@ def train_test_split(full_data, target_label, feature_list):
   return train, test
 
 # Train model using provided training data, parameter grid and target 
-def train_model(train_data, target):
+def train_model(train_data):
   # Gradient boosted regression tree model
-  gbt = GBTRegressor(featuresCol = 'features', labelCol=target)
+  gbt = GBTRegressor(featuresCol = 'features', labelCol="actual_diff")
   
   # Hyperparameters to be tuned
   param_grid = (ParamGridBuilder() \
-               .addGrid(gbt.maxDepth, [2, 5, 8, 10]) \
-               .addGrid(gbt.maxBins, [30, 40, 50, 60]) \
+               .addGrid(gbt.maxDepth, [2, 5, 8]) \
+               .addGrid(gbt.maxBins, [20, 30, 40]) \
                .addGrid(gbt.maxIter, [5, 10, 20]) \
                .build())
 
   # Evaluation metrics
-  eval_ = RegressionEvaluator(labelCol= target, predictionCol= "prediction", metricName="rmse")
+  eval_ = RegressionEvaluator(labelCol= "actual_diff", predictionCol= "prediction", metricName="r2")
 
   # Run rolling k-fold cross validation
   cv = RollingKFoldCV(estimator=gbt, estimatorParamMaps=param_grid, evaluator=eval_, numFolds=2, parallelism=2)  
@@ -194,40 +172,38 @@ def train_model(train_data, target):
   
 
 # Run on test data using best trained model
-def test_model(mdl, target):
-  results = mdl.transform(test)
+def test_model(mdl):
+  results_diff = mdl.transform(test)
+  
+  results = results_diff \
+    .withColumnRenamed("prediction", "pred_diff") \
+    .withColumn("prediction", col("actual")-col("actual_diff")+col("pred_diff"))
   
   # Evaluate predictions
-  reg_eval = RegressionEvaluator(labelCol= target, predictionCol= "prediction")
+  reg_eval = RegressionEvaluator(labelCol= "actual", predictionCol= "prediction")
   rmse = reg_eval.evaluate(results, {reg_eval.metricName: "rmse"})
   print('rmse is ' + str(rmse))
-  mae = reg_eval.evaluate(results, {reg_eval.metricName: "mae"})
-  print('mae is ' + str(mae))
+  mae = reg_eval.evaluate(results, {reg_eval.metricName: "r2"})
+  print('r2 is ' + str(mae))
   
-  # Dummy window
-  w = Window().orderBy(lit('A'))
-  # Get date column
-  return results \
-    .select(col('prediction'), col(target).alias("actual"), 'features') \
-    .withColumn('day_num', row_number().over(w)) \
-    .withColumn('Date', expr("date_add('"+SPLIT_DT+"', day_num-1)"))
+  return results 
 
 # Calculate metrics on prediction data
 def calculate_metrics(pred_data):
-  w = Window.orderBy(col("Date")).rowsBetween(Window.unboundedPreceding, Window.currentRow)
   return pred_data \
-    .withColumn("rmse", sqrt(avg(pow(col('prediction')-col('actual'),2)).over(w))) \
-    .withColumn("smape", 100/col('day_num')*sum(abs(col('prediction')-col('actual'))/(abs(col('prediction'))+abs(col('actual')))).over(w))
+    .agg(\
+      sqrt(avg(pow(col('prediction')-col('actual'),2))).alias("rmse"), \
+      (100/count('*')*sum(abs(col('prediction')-col('actual'))/(abs(col('prediction'))+abs(col('actual'))))).alias("smape"))
 
 # Plot results
-def plot_results(data, cols, label):
+def plot_results(data, cols, country):
   df=data.orderBy("Date").toPandas()
   x = df["Date"]
   for c in cols:
     plt.plot(x, df[c], label = c)
   plt.xlabel('Date')
   plt.ylabel('Num Confirmed Cases')
-  plt.title('New Cases Per Day ('+label+')')
+  plt.title('New Cases Per Day ('+country+')')
   plt.legend()
   plt.xticks(rotation=45)
   plt.show()
@@ -239,16 +215,21 @@ def plot_results(data, cols, label):
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #### 1 Day Prediction Horizon
+
+# COMMAND ----------
+
 # Get train/test data for target country
-target = 'canada_cases'
-train, test = train_test_split(data, target, ORIGINAL_FEATURES)
+target = 'canada'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 1)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -259,7 +240,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -267,9 +251,127 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 7 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'canada'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 7)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 14 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'canada'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 14)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 21 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'canada'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 21)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
 # COMMAND ----------
 
@@ -278,16 +380,21 @@ pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #### 1 Day Prediction Horizon
+
+# COMMAND ----------
+
 # Get train/test data for target country
-target = 'japan_cases'
-train, test = train_test_split(data, target, ORIGINAL_FEATURES)
+target = 'japan'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 1)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -298,7 +405,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -306,9 +416,127 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 7 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'japan'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 7)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 14 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'japan'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 14)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 21 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'japan'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 21)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
 # COMMAND ----------
 
@@ -317,16 +545,21 @@ pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #### 1 Day Prediction Horizon
+
+# COMMAND ----------
+
 # Get train/test data for target country
-target = 'italy_cases'
-train, test = train_test_split(data, target, ORIGINAL_FEATURES)
+target = 'italy'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 1)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -337,7 +570,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -345,9 +581,127 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 7 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'italy'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 7)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 14 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'italy'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 14)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 21 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'italy'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 21)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
 # COMMAND ----------
 
@@ -356,16 +710,21 @@ pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #### 1 Day Prediction Horizon
+
+# COMMAND ----------
+
 # Get train/test data for target country
-target = 'uk_cases'
-train, test = train_test_split(data, target, ORIGINAL_FEATURES)
+target = 'uk'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 1)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -376,7 +735,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -384,9 +746,127 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 7 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'uk'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 7)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 14 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'uk'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 14)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 21 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'uk'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 21)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
 # COMMAND ----------
 
@@ -395,16 +875,21 @@ pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #### 1 Day Prediction Horizon
+
+# COMMAND ----------
+
 # Get train/test data for target country
-target = 'germany_cases'
-train, test = train_test_split(data, target, ORIGINAL_FEATURES)
+target = 'germany'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 1)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -415,7 +900,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -423,9 +911,127 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 7 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'germany'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 7)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 14 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'germany'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 14)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 21 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'germany'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 21)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
 
 # COMMAND ----------
 
@@ -434,16 +1040,21 @@ pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #### 1 Day Prediction Horizon
+
+# COMMAND ----------
+
 # Get train/test data for target country
-target = 'france_cases'
-train, test = train_test_split(data, target, ORIGINAL_FEATURES)
+target = 'france'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 1)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -454,7 +1065,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -462,27 +1076,25 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
-
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+pred_metrics.show()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Predicting Number of Cases for Canada (Extended Data)
+# MAGIC #### 7 Day Prediction Horizon
 
 # COMMAND ----------
 
 # Get train/test data for target country
-target = 'canada_cases'
-train, test = train_test_split(data, target, EXTENDED_FEATURES)
+target = 'france'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 7)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -493,7 +1105,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -501,27 +1116,25 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
-
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+pred_metrics.show()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Predicting Number of Cases for Canada (Only Canada Features)
+# MAGIC #### 14 Day Prediction Horizon
 
 # COMMAND ----------
 
 # Get train/test data for target country
-target = 'canada_cases'
-train, test = train_test_split(data, target, ORIGINAL_FEATURES_CANADA)
+target = 'france'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 14)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -532,7 +1145,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -540,27 +1156,25 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
-
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+pred_metrics.show()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Predicting Number of Cases for Canada (Only Canada Orig + Ext Features)
+# MAGIC #### 21 Day Prediction Horizon
 
 # COMMAND ----------
 
 # Get train/test data for target country
-target = 'canada_cases'
-train, test = train_test_split(data, target, EXTENDED_FEATURES_CANADA)
+target = 'france'
+train, test = train_test_split(data, target, ORIGINAL_FEATURES, 21)
 
 train.show(5)
 
 # COMMAND ----------
 
 # Train model
-model = train_model(train, target)
+model = train_model(train)
 
 # Get best model with optimal hyperparameters
 best_model = model.bestModel
@@ -571,7 +1185,10 @@ best_params = best_model.extractParamMap()
 # COMMAND ----------
 
 # Get predictions using test data
-pred = test_model(model, target)
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
 
 plot_results(pred, ["actual", "prediction"], target)
 
@@ -579,10 +1196,173 @@ plot_results(pred, ["actual", "prediction"], target)
 
 # Evaluate performance/accuracy
 pred_metrics = calculate_metrics(pred)
-
-# RMSE and sMAPE values for 1 day, 7 day, 14 day and 30 day predictions
-pred_metrics.select("day_num","Date","rmse","smape").filter(col("day_num").isin(1,7,14,30)).show()
+pred_metrics.show()
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Predicting Number of Cases for Canada (Extended Features)
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 1 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'canada'
+train, test = train_test_split(data, target, EXTENDED_FEATURES, 1)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 7 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'canada'
+train, test = train_test_split(data, target, EXTENDED_FEATURES, 7)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 14 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'canada'
+train, test = train_test_split(data, target, EXTENDED_FEATURES, 14)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### 21 Day Prediction Horizon
+
+# COMMAND ----------
+
+# Get train/test data for target country
+target = 'canada'
+train, test = train_test_split(data, target, EXTENDED_FEATURES, 21)
+
+train.show(5)
+
+# COMMAND ----------
+
+# Train model
+model = train_model(train)
+
+# Get best model with optimal hyperparameters
+best_model = model.bestModel
+best_params = best_model.extractParamMap()
+
+{p[0].name: p[1] for p in best_params.items()}
+
+# COMMAND ----------
+
+# Get predictions using test data
+pred = test_model(model)
+pred.show(10)
+
+# COMMAND ----------
+
+plot_results(pred, ["actual", "prediction"], target)
+
+# COMMAND ----------
+
+# Evaluate performance/accuracy
+pred_metrics = calculate_metrics(pred)
+pred_metrics.show()
+
+# COMMAND ----------
+
+# MAGIC %md
