@@ -162,7 +162,7 @@ def train_model(train_data):
                .build())
 
   # Evaluation metrics
-  eval_ = RegressionEvaluator(labelCol= "actual_diff", predictionCol= "prediction", metricName="r2")
+  eval_ = RegressionEvaluator(labelCol= "actual_diff", predictionCol= "prediction", metricName="rmse")
 
   # Run rolling k-fold cross validation
   cv = RollingKFoldCV(estimator=gbt, estimatorParamMaps=param_grid, evaluator=eval_, numFolds=2, parallelism=2)  
